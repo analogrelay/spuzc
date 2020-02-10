@@ -1,9 +1,9 @@
 use nom_locate::LocatedSpan;
 
-mod error;
+pub mod diag;
 mod tokens;
 
-pub use error::Error;
+pub use diag::Diagnostic;
 
 pub type Span<'a> = LocatedSpan<&'a str>;
-pub type Result<T> = ::std::result::Result<T, Error>;
+pub type Result<T> = ::std::result::Result<T, Vec<Diagnostic>>;

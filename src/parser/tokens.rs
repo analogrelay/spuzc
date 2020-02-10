@@ -5,7 +5,7 @@ use nom::combinator::*;
 use nom::sequence::*;
 use nom::IResult;
 
-use crate::parser::{Error, Result, Span};
+use crate::parser::{diag, Result, Span};
 
 #[derive(Debug)]
 pub struct Token<'a> {
@@ -31,23 +31,25 @@ fn integer(inp: Span) -> IResult<Span, Result<Token>> {
     map(recognize(preceded(sign, digit1)), |sp: Span| {
         let val = match sp.fragment.parse::<i64>() {
             Ok(v) => v,
-            Err(_) => return Err(Error::ParseIntError(sp.fragment.to_string())),
+            Err(_) => return Err(diag::known(diag::TOK0001)),
         };
         Ok(Token::new(sp, TokenKind::Integer(val)))
     })(inp)
 }
 
 fn float(inp: Span) -> IResult<Span, Result<Token>> {
+    let exponent = preceded(one_of("eE"), preceded(opt(one_of("+-")), digit1));
+
     let after_decimal = preceded(char('.'), digit1);
 
-    let exponent = preceded(one_of("eE"), pair(opt(one_of("+-")), digit1));
+    let int_part = preceded(opt(one_of("+-")), digit1);
 
-    let number = tuple((opt(one_of("+-")), digit1, opt(after_decimal), opt(exponent)));
+    let number = pair(pair(int_part, opt(after_decimal)), opt(exponent));
 
     map(recognize(number), |sp: Span| {
         let val = match sp.fragment.parse::<f64>() {
             Ok(v) => v,
-            Err(_) => return Err(Error::ParseFloatError(sp.fragment.to_string())),
+            Err(_) => return Err(diag::known(diag::TOK0002)),
         };
         Ok(Token::new(sp, TokenKind::Float(val)))
     })(inp)
@@ -57,44 +59,43 @@ fn float(inp: Span) -> IResult<Span, Result<Token>> {
 mod tests {
     use super::*;
 
-    #[test]
-    pub fn can_recognize_digits() {
-        let output = integer(Span::new("42")).unwrap();
-        assert_eq!(
-            output.0,
-            Span {
-                offset: 2,
-                line: 1,
-                fragment: "",
-                extra: ()
+    macro_rules! single_token_test {
+        ($name: ident, $parser: ident($content: expr) => $kind: expr) => {
+            #[test]
+            pub fn $name() {
+                let content = format!("{} other_content", $content);
+                let output = $parser(Span::new(&content)).unwrap();
+                assert_eq!(
+                    output.0,
+                    Span {
+                        offset: $content.len(),
+                        line: 1,
+                        fragment: " other_content",
+                        extra: ()
+                    }
+                );
+                assert_eq!(output.1.unwrap().kind, $kind);
             }
-        );
-        assert_eq!(output.1.unwrap().kind, TokenKind::Integer(42));
+        };
+        ($name: ident, $parser: ident($content: expr) err $known_diag: expr) => {
+            #[test]
+            pub fn $name() {
+                let content = format!("{} other_content", $content);
+                let diags = $parser(Span::new(&content)).unwrap().1.unwrap_err();
+                assert_eq!(diags, diag::known($known_diag));
+            }
+        };
     }
 
-    #[test]
-    pub fn can_recognize_negative_digits() {
-        let output = integer(Span::new("-42")).unwrap();
-        assert_eq!(
-            output.0,
-            Span {
-                offset: 3,
-                line: 1,
-                fragment: "",
-                extra: ()
-            }
-        );
-        assert_eq!(output.1.unwrap().kind, TokenKind::Integer(-42));
-    }
+    single_token_test!(unsigned_int, integer("42") => TokenKind::Integer(42));
+    single_token_test!(neg_int, integer("-42") => TokenKind::Integer(-42));
+    single_token_test!(pos_int, integer("+42") => TokenKind::Integer(42));
+    single_token_test!(too_large, integer("9223372036854776000") err diag::TOK0001);
 
-    #[test]
-    pub fn fails_if_too_large_for_i64() {
-        assert_eq!(
-            integer(Span::new("9223372036854776000")).unwrap_err(),
-            nom::Err::Error((
-                Span::new("9223372036854776000"),
-                nom::error::ErrorKind::MapRes
-            ))
-        )
-    }
+    single_token_test!(unsigned_float, float("4.2") => TokenKind::Float(4.2));
+    single_token_test!(pos_float, float("+4.2") => TokenKind::Float(4.2));
+    single_token_test!(neg_float, float("-4.2") => TokenKind::Float(-4.2));
+    single_token_test!(float_exp, float("4.2e2") => TokenKind::Float(4.2e2));
+    single_token_test!(pos_float_exp, float("+4.2e+2") => TokenKind::Float(4.2e2));
+    single_token_test!(neg_float_exp, float("-4.2e-2") => TokenKind::Float(-4.2e-2));
 }
