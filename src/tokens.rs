@@ -1,9 +1,19 @@
-use crate::text::{Spanned, Window};
+use crate::text::{Spanned, TextError, Window};
 
 #[derive(Debug)]
 pub enum TokenError {
     EndOfFile,
+    InvalidText(TextError),
     Unexpected(char),
+}
+
+impl From<TextError> for TokenError {
+    fn from(e: TextError) -> TokenError {
+        match e {
+            TextError::OutOfBounds => TokenError::EndOfFile,
+            e => TokenError::InvalidText(e),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -13,12 +23,13 @@ pub enum Token {
 }
 
 pub fn next_token(window: &mut Window) -> Result<Spanned<Token>, TokenError> {
-    if let Some(c) = window.next() {
-        match c {
-            x => Err(TokenError::Unexpected(x)),
-        }
-    } else {
-        Err(TokenError::EndOfFile)
+    // Discard whitespace
+    window.take_while(char::is_whitespace)?;
+    window.advance();
+
+    match window.take()? {
+        '(' => Ok(window.complete(Token::LParen)),
+        x => Err(TokenError::Unexpected(x)),
     }
 }
 
