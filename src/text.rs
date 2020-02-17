@@ -83,25 +83,16 @@ impl Span {
         Span { start, end }
     }
 
-    fn reset(&self, text: &str) -> Span {
-        Span::new(self.start, self.start).expand(text)
-    }
+    fn expand(&self, c: char) -> Span {
+        let (line, column) = match c {
+            '\n' => (self.end.line + 1, 0),
+            _ => (self.end.line, self.end.column + 1),
+        };
 
-    fn expand(&self, text: &str) -> Span {
-        let (offset, line, column) = text.chars().fold(
-            (self.end.offset, self.end.line, self.end.column),
-            |(o, l, c), chr| {
-                if chr == '\n' {
-                    (o + 1, l + 1, 0)
-                } else {
-                    (o + 1, l, c + 1)
-                }
-            },
-        );
         Span {
             start: self.start,
             end: Location {
-                offset,
+                offset: self.end.offset + c.len_utf8(),
                 column,
                 line,
             },
@@ -109,36 +100,31 @@ impl Span {
     }
 }
 
-pub trait PeekPredicate {
-    fn peek_predicate(&self, win: &Window) -> Option<usize>;
+pub trait CharPattern {
+    fn matches(self, c: char) -> bool;
 }
 
-impl<F: Fn(char) -> bool> PeekPredicate for F {
-    fn peek_predicate(&self, win: &Window) -> Option<usize> {
-        match win.next() {
-            Some(c) if self(c) => Some(1),
-            _ => None,
-        }
+impl CharPattern for std::ops::Range<char> {
+    fn matches(self, c: char) -> bool {
+        self.contains(&c)
     }
 }
 
-impl PeekPredicate for char {
-    fn peek_predicate(&self, win: &Window) -> Option<usize> {
-        match win.next() {
-            Some(c) if c == *self => Some(1),
-            _ => None,
-        }
+impl CharPattern for std::ops::RangeInclusive<char> {
+    fn matches(self, c: char) -> bool {
+        self.contains(&c)
     }
 }
 
-impl PeekPredicate for &str {
-    fn peek_predicate(&self, win: &Window) -> Option<usize> {
-        let l = self.len();
-        if win.lookahead(l) == *self {
-            Some(l)
-        } else {
-            None
-        }
+impl CharPattern for char {
+    fn matches(self, c: char) -> bool {
+        self == c
+    }
+}
+
+impl<F: Fn(char) -> bool> CharPattern for F {
+    fn matches(self, c: char) -> bool {
+        self(c)
     }
 }
 
@@ -188,59 +174,47 @@ impl<'a> Window<'a> {
     }
 
     pub fn take(&mut self) -> Result<char, TextError> {
-        if self.span.end.offset + 1 > self.document.text.len() {
-            Err(TextError::OutOfBounds)
-        } else {
-            // Compute character width
-            let (c, new_end) = read_char(&self.document.text, self.span.end.offset)?;
-            self.span = self
-                .span
-                .expand(&self.document.text[self.span.end.offset..new_end]);
-            Ok(c)
+        match self.next() {
+            None => Err(TextError::OutOfBounds),
+            Some(c) => {
+                self.span = self.span.expand(c);
+                Ok(c)
+            }
         }
-    }
-
-    // Look ahead `count` **bytes** and return the resulting string if it's valid.
-    pub fn lookahead(&self, count: usize) -> &str {
-        let end = std::cmp::min(self.document.text.len(), self.span.end.offset + count);
-        match self.document.text.get(self.span.end.offset..end) {
-            Some(s) => s,
-            None => "",
-        }
-    }
-
-    pub fn peek<P: PeekPredicate>(&self, predicate: P) -> bool {
-        match predicate.peek_predicate(self) {
-            Some(_) => true,
-            None => false,
-        }
-    }
-
-    pub fn take_until<P: PeekPredicate>(&mut self, predicate: P) -> Result<usize, TextError> {
-        let mut count = 0;
-        while let None = predicate.peek_predicate(self) {
-            count += 1;
-            self.take()?;
-        }
-        Ok(count)
-    }
-
-    pub fn take_while<P: PeekPredicate>(&mut self, predicate: P) -> Result<usize, TextError> {
-        Urgh, need to determine if we're working in chars, bytes or both...
     }
 
     pub fn next(&self) -> Option<char> {
-        // TODO: Could definitely unify this with take.
         if self.span.end.offset + 1 > self.document.text.len() {
             None
         } else {
             // Compute character width
-            let (c, _) = match read_char(&self.document.text, self.span.end.offset + 1) {
+            let (c, _) = match read_char(&self.document.text, self.span.end.offset) {
                 Ok(x) => x,
                 Err(_) => return None,
             };
             Some(c)
         }
+    }
+
+    pub fn peek<P: CharPattern>(&self, pattern: P) -> bool {
+        match self.next() {
+            None => false,
+            Some(c) => pattern.matches(c),
+        }
+    }
+
+    pub fn take_while<P: CharPattern + Clone>(&mut self, pattern: P) -> Result<(), TextError> {
+        while self.peek(pattern.clone()) {
+            self.take()?;
+        }
+        Ok(())
+    }
+
+    pub fn take_until<P: CharPattern + Clone>(&mut self, pattern: P) -> Result<(), TextError> {
+        while !self.peek(pattern.clone()) {
+            self.take()?;
+        }
+        Ok(())
     }
 
     pub fn advance(&mut self) -> Span {
@@ -252,18 +226,6 @@ impl<'a> Window<'a> {
     pub fn complete<T>(&mut self, value: T) -> Spanned<T> {
         let span = self.advance();
         Spanned::new(value, span)
-    }
-
-    pub fn backtrack(&mut self, count: usize) -> Result<(), TextError> {
-        let new_end = (self.span.end.offset as isize) - (count as isize);
-        if new_end < (self.span.start.offset as isize) {
-            Err(TextError::OutOfBounds)
-        } else {
-            // Update end
-            let new_text = &self.document.text[self.span.start.offset..(new_end as usize)];
-            self.span = self.span.reset(new_text);
-            Ok(())
-        }
     }
 }
 
@@ -304,6 +266,17 @@ mod tests {
         assert_eq!(win.content(), "this");
         assert_eq!(win.span().start.tup(), (0, 0, 0));
         assert_eq!(win.span().end.tup(), (4, 0, 4));
+    }
+
+    #[test]
+    pub fn window_take_emoji() {
+        let doc = Document::new("✨a");
+        let mut win = Window::new(&doc);
+
+        assert_eq!(win.take(), Ok('✨'));
+        assert_eq!(win.take(), Ok('a'));
+        assert_eq!(win.span().start.tup(), (0, 0, 0));
+        assert_eq!(win.span().end.tup(), (4, 0, 2));
     }
 
     #[test]
@@ -373,58 +346,65 @@ mod tests {
     }
 
     #[test]
-    pub fn window_lookahead() {
-        let doc = Document::new("this is a");
-        let mut win = Window::new(&doc);
-
-        win.take_many(4).unwrap();
-        assert_eq!(win.lookahead(3), " is");
-        win.take_many(3).unwrap();
-        win.advance();
-
-        assert_eq!(win.lookahead(40), " a");
-    }
-
-    #[test]
     pub fn window_peek() {
         let doc = Document::new("this is a");
         let mut win = Window::new(&doc);
 
+        assert!(win.peek('t'));
         win.take_many(4).unwrap();
-        assert!(!win.peek("is"));
-        assert!(win.peek(" is"));
-
-        win.take_many(3).unwrap();
-        assert!(!win.peek("a test document"));
+        assert!(!win.peek('i'));
+        assert!(win.peek(char::is_whitespace));
     }
 
     #[test]
-    pub fn window_backtrack() {
-        let doc = Document::new("th\nis");
+    pub fn window_peek_emoji() {
+        let doc = Document::new("a✨a");
         let mut win = Window::new(&doc);
 
-        win.take_many(5).unwrap();
-        win.backtrack(3).unwrap();
-        assert_eq!(win.content(), "th");
-        assert_eq!(win.span().start.tup(), (0, 0, 0));
-        assert_eq!(win.span().end.tup(), (2, 0, 2));
-    }
-
-    #[test]
-    pub fn window_backtrack_out_of_bounds() {
-        let doc = Document::new("this is a test document");
-        let mut win = Window::new(&doc);
-
-        win.take_many(4).unwrap();
-        assert_eq!(win.backtrack(8), Err(TextError::OutOfBounds));
+        assert!(!win.peek('✨'));
+        win.take().unwrap();
+        assert!(win.peek('✨'));
     }
 
     #[test]
     pub fn window_take_while() {
+        let doc = Document::new("aaaab");
+        let mut win = Window::new(&doc);
+
+        assert_eq!(win.take_while('a'), Ok(()));
+        assert_eq!(win.content(), "aaaa");
+        assert_eq!(win.span().start.tup(), (0, 0, 0));
+        assert_eq!(win.span().end.tup(), (4, 0, 4));
+    }
+
+    #[test]
+    pub fn window_take_while_range() {
+        let doc = Document::new("1234test");
+        let mut win = Window::new(&doc);
+
+        assert_eq!(win.take_while('0'..='9'), Ok(()));
+        assert_eq!(win.content(), "1234");
+        assert_eq!(win.span().start.tup(), (0, 0, 0));
+        assert_eq!(win.span().end.tup(), (4, 0, 4));
+    }
+
+    #[test]
+    pub fn window_take_while_emoji() {
+        let doc = Document::new("✨✨✨✨b");
+        let mut win = Window::new(&doc);
+
+        assert_eq!(win.take_while('✨'), Ok(()));
+        assert_eq!(win.content(), "✨✨✨✨");
+        assert_eq!(win.span().start.tup(), (0, 0, 0));
+        assert_eq!(win.span().end.tup(), (12, 0, 4));
+    }
+
+    #[test]
+    pub fn window_take_while_fn() {
         let doc = Document::new("this is a test document");
         let mut win = Window::new(&doc);
 
-        assert_eq!(win.take_while(char::is_alphabetic), Ok(4));
+        assert_eq!(win.take_while(char::is_alphabetic), Ok(()));
         assert_eq!(win.content(), "this");
         assert_eq!(win.span().start.tup(), (0, 0, 0));
         assert_eq!(win.span().end.tup(), (4, 0, 4));
@@ -435,29 +415,40 @@ mod tests {
         let doc = Document::new("this is a test document");
         let mut win = Window::new(&doc);
 
-        assert_eq!(win.take_until(' '), Ok(4));
+        assert_eq!(win.take_until(' '), Ok(()));
         assert_eq!(win.content(), "this");
         assert_eq!(win.span().start.tup(), (0, 0, 0));
         assert_eq!(win.span().end.tup(), (4, 0, 4));
     }
 
     #[test]
-    pub fn window_take_until_str() {
-        let doc = Document::new("this is a test document");
+    pub fn window_take_until_range() {
+        let doc = Document::new("this42");
         let mut win = Window::new(&doc);
 
-        assert_eq!(win.take_until(" is"), Ok(4));
+        assert_eq!(win.take_until('0'..='9'), Ok(()));
         assert_eq!(win.content(), "this");
         assert_eq!(win.span().start.tup(), (0, 0, 0));
         assert_eq!(win.span().end.tup(), (4, 0, 4));
     }
 
     #[test]
-    pub fn window_take_while_str() {
+    pub fn window_take_until_emoji() {
+        let doc = Document::new("aaaa✨");
+        let mut win = Window::new(&doc);
+
+        assert_eq!(win.take_until('✨'), Ok(()));
+        assert_eq!(win.content(), "aaaa");
+        assert_eq!(win.span().start.tup(), (0, 0, 0));
+        assert_eq!(win.span().end.tup(), (4, 0, 4));
+    }
+
+    #[test]
+    pub fn window_take_until_fn() {
         let doc = Document::new("this is a test document");
         let mut win = Window::new(&doc);
 
-        assert_eq!(win.take_while("this"), Ok(4));
+        assert_eq!(win.take_until(char::is_whitespace), Ok(()));
         assert_eq!(win.content(), "this");
         assert_eq!(win.span().start.tup(), (0, 0, 0));
         assert_eq!(win.span().end.tup(), (4, 0, 4));
