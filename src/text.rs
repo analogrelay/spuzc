@@ -40,7 +40,7 @@ impl Document {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct Location {
     pub offset: usize,
     pub column: usize,
@@ -54,20 +54,31 @@ impl Location {
         line: 0,
     };
 
-    pub fn new(offset: usize, column: usize, line: usize) -> Location {
+    pub fn new(offset: usize, line: usize, column: usize) -> Location {
         Location {
             offset,
             column,
             line,
         }
     }
+}
 
-    pub(crate) fn tup(&self) -> (usize, usize, usize) {
-        (self.offset, self.line, self.column)
+impl From<Location> for (usize, usize, usize) {
+    fn from(l: Location) -> (usize, usize, usize) {
+        (l.offset, l.line, l.column)
     }
 }
 
-#[derive(Copy, Clone)]
+impl From<(usize, usize, usize)> for Location {
+    fn from((o, l, c): (usize, usize, usize)) -> Location {
+        Location::new(o, l, c)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct NonContiguousSpansError;
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub struct Span {
     pub start: Location,
     pub end: Location,
@@ -83,6 +94,14 @@ impl Span {
         Span { start, end }
     }
 
+    pub fn append(&self, next: Span) -> Result<Span, NonContiguousSpansError> {
+        if self.end != next.start {
+            Err(NonContiguousSpansError)
+        } else {
+            Ok(Span::new(self.start, next.end))
+        }
+    }
+
     fn expand(&self, c: char) -> Span {
         let (line, column) = match c {
             '\n' => (self.end.line + 1, 0),
@@ -91,11 +110,7 @@ impl Span {
 
         Span {
             start: self.start,
-            end: Location {
-                offset: self.end.offset + c.len_utf8(),
-                column,
-                line,
-            },
+            end: (self.end.offset + c.len_utf8(), line, column).into(),
         }
     }
 }
@@ -218,17 +233,16 @@ impl<'a> Window<'a> {
     }
 
     pub fn advance(&mut self) -> Span {
-        let ret = self.span;
-        self.span = Span::new(self.span.end, self.span.end);
-        ret
+        let new_end = Span::new(self.span.end, self.span.end);
+        std::mem::replace(&mut self.span, new_end)
     }
 
     pub fn complete<T>(&mut self, value: T) -> Spanned<T> {
-        let span = self.advance();
-        Spanned::new(value, span)
+        Spanned::new(value, self.advance())
     }
 }
 
+#[derive(Debug)]
 pub struct Spanned<T> {
     pub value: T,
     pub span: Span,
@@ -240,17 +254,41 @@ impl<T> Spanned<T> {
     }
 }
 
+impl<T, U: PartialEq<T>> PartialEq<Spanned<T>> for Spanned<U> {
+    fn eq(&self, other: &Spanned<T>) -> bool {
+        self.span == other.span && self.value == other.value
+    }
+}
+
+impl<U: Eq> Eq for Spanned<U> {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    pub fn span_append_contiguous() {
+        let left = Span::new((0, 0, 0).into(), (1, 0, 1).into());
+        let right = Span::new((1, 0, 1).into(), (2, 1, 0).into());
+        let merged = left.append(right).unwrap();
+        assert_eq!(merged.start, (0, 0, 0).into());
+        assert_eq!(merged.end, (2, 1, 0).into());
+    }
+
+    #[test]
+    pub fn span_append_non_contiguous() {
+        let left = Span::new((0, 0, 0).into(), (1, 0, 1).into());
+        let right = Span::new((2, 0, 2).into(), (3, 1, 0).into());
+        assert_eq!(left.append(right), Err(NonContiguousSpansError));
+    }
 
     #[test]
     pub fn empty_window() {
         let doc = Document::new("this is a test document");
         let win = Window::new(&doc);
         assert_eq!(win.content(), "");
-        assert_eq!(win.span().start.tup(), (0, 0, 0));
-        assert_eq!(win.span().end.tup(), (0, 0, 0));
+        assert_eq!(win.span().start, (0, 0, 0).into());
+        assert_eq!(win.span().end, (0, 0, 0).into());
     }
 
     #[test]
@@ -264,8 +302,8 @@ mod tests {
         assert_eq!(win.take(), Ok('s'));
 
         assert_eq!(win.content(), "this");
-        assert_eq!(win.span().start.tup(), (0, 0, 0));
-        assert_eq!(win.span().end.tup(), (4, 0, 4));
+        assert_eq!(win.span().start, (0, 0, 0).into());
+        assert_eq!(win.span().end, (4, 0, 4).into());
     }
 
     #[test]
@@ -275,27 +313,27 @@ mod tests {
 
         assert_eq!(win.take(), Ok('✨'));
         assert_eq!(win.take(), Ok('a'));
-        assert_eq!(win.span().start.tup(), (0, 0, 0));
-        assert_eq!(win.span().end.tup(), (4, 0, 2));
+        assert_eq!(win.span().start, (0, 0, 0).into());
+        assert_eq!(win.span().end, (4, 0, 2).into());
     }
 
     #[test]
     pub fn window_take_new_lines() {
         let doc = Document::new("this\r\nis\na\rtest");
         let mut win = Window::new(&doc);
-        assert_eq!(win.span().start.tup(), (0, 0, 0));
+        assert_eq!(win.span().start, (0, 0, 0).into());
 
         win.take_many(6).unwrap();
         assert_eq!(win.content(), "this\r\n");
-        assert_eq!(win.span().end.tup(), (6, 1, 0));
+        assert_eq!(win.span().end, (6, 1, 0).into());
 
         win.take_many(3).unwrap();
         assert_eq!(win.content(), "this\r\nis\n");
-        assert_eq!(win.span().end.tup(), (9, 2, 0));
+        assert_eq!(win.span().end, (9, 2, 0).into());
 
         win.take_many(6).unwrap();
         assert_eq!(win.content(), "this\r\nis\na\rtest");
-        assert_eq!(win.span().end.tup(), (15, 2, 6));
+        assert_eq!(win.span().end, (15, 2, 6).into());
     }
 
     #[test]
@@ -312,20 +350,20 @@ mod tests {
 
         win.take_many(4).unwrap();
         assert_eq!(win.content(), "this");
-        assert_eq!(win.span().start.tup(), (0, 0, 0));
-        assert_eq!(win.span().end.tup(), (4, 0, 4));
+        assert_eq!(win.span().start, (0, 0, 0).into());
+        assert_eq!(win.span().end, (4, 0, 4).into());
 
         win.advance();
         win.take_many(3).unwrap();
         assert_eq!(win.content(), " is");
-        assert_eq!(win.span().start.tup(), (4, 0, 4));
-        assert_eq!(win.span().end.tup(), (7, 0, 7));
+        assert_eq!(win.span().start, (4, 0, 4).into());
+        assert_eq!(win.span().end, (7, 0, 7).into());
 
         win.advance();
         win.take_many(2).unwrap();
         assert_eq!(win.content(), " a");
-        assert_eq!(win.span().start.tup(), (7, 0, 7));
-        assert_eq!(win.span().end.tup(), (9, 0, 9));
+        assert_eq!(win.span().start, (7, 0, 7).into());
+        assert_eq!(win.span().end, (9, 0, 9).into());
     }
 
     #[test]
@@ -337,11 +375,11 @@ mod tests {
         let ret = win.complete((42, "skidoo"));
 
         assert_eq!(win.content(), "");
-        assert_eq!(win.span().start.tup(), (4, 0, 4));
-        assert_eq!(win.span().end.tup(), (4, 0, 4));
+        assert_eq!(win.span().start, (4, 0, 4).into());
+        assert_eq!(win.span().end, (4, 0, 4).into());
 
-        assert_eq!(ret.span.start.tup(), (0, 0, 0));
-        assert_eq!(ret.span.end.tup(), (4, 0, 4));
+        assert_eq!(ret.span.start, (0, 0, 0).into());
+        assert_eq!(ret.span.end, (4, 0, 4).into());
         assert_eq!(ret.value, (42, "skidoo"));
     }
 
@@ -373,8 +411,8 @@ mod tests {
 
         assert_eq!(win.take_while('a'), Ok(()));
         assert_eq!(win.content(), "aaaa");
-        assert_eq!(win.span().start.tup(), (0, 0, 0));
-        assert_eq!(win.span().end.tup(), (4, 0, 4));
+        assert_eq!(win.span().start, (0, 0, 0).into());
+        assert_eq!(win.span().end, (4, 0, 4).into());
     }
 
     #[test]
@@ -384,8 +422,8 @@ mod tests {
 
         assert_eq!(win.take_while('0'..='9'), Ok(()));
         assert_eq!(win.content(), "1234");
-        assert_eq!(win.span().start.tup(), (0, 0, 0));
-        assert_eq!(win.span().end.tup(), (4, 0, 4));
+        assert_eq!(win.span().start, (0, 0, 0).into());
+        assert_eq!(win.span().end, (4, 0, 4).into());
     }
 
     #[test]
@@ -395,8 +433,8 @@ mod tests {
 
         assert_eq!(win.take_while('✨'), Ok(()));
         assert_eq!(win.content(), "✨✨✨✨");
-        assert_eq!(win.span().start.tup(), (0, 0, 0));
-        assert_eq!(win.span().end.tup(), (12, 0, 4));
+        assert_eq!(win.span().start, (0, 0, 0).into());
+        assert_eq!(win.span().end, (12, 0, 4).into());
     }
 
     #[test]
@@ -406,8 +444,8 @@ mod tests {
 
         assert_eq!(win.take_while(char::is_alphabetic), Ok(()));
         assert_eq!(win.content(), "this");
-        assert_eq!(win.span().start.tup(), (0, 0, 0));
-        assert_eq!(win.span().end.tup(), (4, 0, 4));
+        assert_eq!(win.span().start, (0, 0, 0).into());
+        assert_eq!(win.span().end, (4, 0, 4).into());
     }
 
     #[test]
@@ -417,8 +455,8 @@ mod tests {
 
         assert_eq!(win.take_until(' '), Ok(()));
         assert_eq!(win.content(), "this");
-        assert_eq!(win.span().start.tup(), (0, 0, 0));
-        assert_eq!(win.span().end.tup(), (4, 0, 4));
+        assert_eq!(win.span().start, (0, 0, 0).into());
+        assert_eq!(win.span().end, (4, 0, 4).into());
     }
 
     #[test]
@@ -428,8 +466,8 @@ mod tests {
 
         assert_eq!(win.take_until('0'..='9'), Ok(()));
         assert_eq!(win.content(), "this");
-        assert_eq!(win.span().start.tup(), (0, 0, 0));
-        assert_eq!(win.span().end.tup(), (4, 0, 4));
+        assert_eq!(win.span().start, (0, 0, 0).into());
+        assert_eq!(win.span().end, (4, 0, 4).into());
     }
 
     #[test]
@@ -439,8 +477,8 @@ mod tests {
 
         assert_eq!(win.take_until('✨'), Ok(()));
         assert_eq!(win.content(), "aaaa");
-        assert_eq!(win.span().start.tup(), (0, 0, 0));
-        assert_eq!(win.span().end.tup(), (4, 0, 4));
+        assert_eq!(win.span().start, (0, 0, 0).into());
+        assert_eq!(win.span().end, (4, 0, 4).into());
     }
 
     #[test]
@@ -450,7 +488,7 @@ mod tests {
 
         assert_eq!(win.take_until(char::is_whitespace), Ok(()));
         assert_eq!(win.content(), "this");
-        assert_eq!(win.span().start.tup(), (0, 0, 0));
-        assert_eq!(win.span().end.tup(), (4, 0, 4));
+        assert_eq!(win.span().start, (0, 0, 0).into());
+        assert_eq!(win.span().end, (4, 0, 4).into());
     }
 }

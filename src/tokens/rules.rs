@@ -1,36 +1,5 @@
-use crate::text::{Spanned, TextError, Window};
-
-#[derive(Debug)]
-pub enum TokenError {
-    EndOfFile,
-    InvalidText(TextError),
-    InvalidNumber(String),
-    Unexpected(char),
-}
-
-impl From<TextError> for TokenError {
-    fn from(e: TextError) -> TokenError {
-        match e {
-            TextError::OutOfBounds => TokenError::EndOfFile,
-            e => TokenError::InvalidText(e),
-        }
-    }
-}
-
-#[derive(Debug, PartialEq)]
-pub enum Token {
-    LParen,
-    RParen,
-    LBrace,
-    RBrace,
-    Colon,
-
-    Func,
-    Int,
-
-    Identifier(String),
-    Integer(i128),
-}
+use crate::text::{Spanned, Window};
+use crate::tokens::{Token, TokenError};
 
 pub fn next_token(window: &mut Window) -> Result<Spanned<Token>, TokenError> {
     // Discard whitespace
@@ -86,8 +55,8 @@ mod tests {
                 let tok = next_token(&mut win).unwrap();
 
                 assert_eq!(doc.text_at(tok.span), orig);
-                assert_eq!(tok.span.start.tup(), (4, 0, 4));
-                assert_eq!(tok.span.end.tup(), (4 + orig.len(), 0, 4 + char_count));
+                assert_eq!(tok.span.start, (4, 0, 4).into());
+                assert_eq!(tok.span.end, (4 + orig.len(), 0, 4 + char_count).into());
                 assert_eq!(tok.value, $token);
             }
         };
